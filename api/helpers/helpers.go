@@ -33,3 +33,9 @@ func EnforceHTTP(url_str string) string {
 	}
 	return url_str
 }
+
+// Check if a string is a valid URL
+func IsURL(str string) bool {
+	u, err := url.ParseRequestURI(str)
+	return err == nil && u.Scheme != "" && u.Host != ""
+}

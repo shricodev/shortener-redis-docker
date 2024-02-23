@@ -24,15 +24,15 @@ type response struct {
 
 func ShortenURL(c *fiber.Ctx) error {
 	body := new(request)
-	if err := c.BodyParser(&body); err != nil {
+	if !helpers.IsURL(body.URL) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Cannot parse JSON",
+			"error": "Invalid URL",
 		})
 	}
 
-	if !govalidator.IsURL(body.URL) {
+	if err := c.BodyParser(&body); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid URL",
+			"error": "Cannot parse JSON",
 		})
 	}
 
