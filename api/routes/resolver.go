@@ -1,8 +1,8 @@
 package routes
 
 import (
+	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/shricodev/shortener-redis-docker/database"
 )

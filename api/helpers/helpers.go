@@ -7,11 +7,11 @@ import (
 )
 
 // If the user provides the main server domain to abuse the system
-func CheckForApplicationMatch(url_str string) bool {
+func CheckForApplicationMatch(urlStr string) bool {
 	applicationHost := os.Getenv("APPLICATION_HOST")
 	applicationPort := os.Getenv("APPLICATION_PORT")
 
-	parsedUrl, err := url.Parse(url_str)
+	parsedUrl, err := url.Parse(urlStr)
 	if err != nil {
 		return false
 	}
@@ -32,10 +32,4 @@ func EnforceHTTP(urlStr string) string {
 		return "http://" + urlStr
 	}
 	return urlStr
-}
-
-// Check if a string is a valid URL
-func IsURL(str string) bool {
-	u, err := url.ParseRequestURI(str)
-	return err == nil && u.Scheme != "" && u.Host != ""
 }

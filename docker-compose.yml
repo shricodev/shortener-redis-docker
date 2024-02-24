@@ -1,0 +1,24 @@
+version: "3"
+# Define services for the application
+services:
+  # API service configuration
+  api:
+    # Build the API image using the 'api' directory
+    build: api
+    # Expose port 3000 on the host and map it to port 3000 in the container
+    ports:
+      - "3000:3000"
+    # Specify that this service depends on the 'database' service
+    depends_on:
+      - database
+
+  # Database service configuration
+  database:
+    # Build the database image using the 'database' directory
+    build: database
+    # Expose port 6379 on the host and map it to port 6379 in the container
+    ports:
+      - "6379:6379"
+    # Create a named volume '.volumes' and mount it to '/volumes' in the container
+    volumes:
+      - ./volumes:/data

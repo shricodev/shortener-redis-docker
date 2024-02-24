@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asaskevich/govalidator"
+	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/shricodev/shortener-redis-docker/database"
 	"github.com/shricodev/shortener-redis-docker/helpers"
@@ -17,7 +18,7 @@ import (
 
 const (
 	rateLimitDuration   = 24 * time.Hour
-	customShortUrlIdLen = 3
+	customShortUrlIdLen = 6
 )
 
 type request struct {
@@ -27,131 +28,137 @@ type request struct {
 }
 
 type response struct {
-	URL              string        `json:"url"`
-	CustomShortUrlId string        `json:"custom_short"`
-	Expiration       time.Duration `json:"expiration"`
-	XRateRemains     int           `json:"x-rate-remain"`
-	XRateLimitReset  time.Duration `json:"x-rate-limit-reset"`
+	URL             string        `json:"url"`
+	CustomShort     string        `json:"custom_short"`
+	Expiration      time.Duration `json:"expiration"`
+	XRateRemains    int           `json:"x-rate-remain"`
+	XRateLimitReset time.Duration `json:"x-rate-limit-reset"`
 }
 
+// ShortenURL orchestrates the shortening process by validating the request, generating the short URL, and preparing the response.
 func ShortenURL(c *fiber.Ctx) error {
 	body := new(request)
 
-	if !helpers.IsURL(body.URL) {
+	if err := c.BodyParser(&body); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid URL",
+			"error": "Cannot parse JSON body",
 		})
 	}
 
+	if err := ValidateRequest(c, body); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	shortUrlID, err := GenerateShortURL(c, body)
+	if err != nil {
+		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	r2 := database.CreateClient(1)
+	defer r2.Close()
+
+	quotaLeft, _ := r2.Get(database.Ctx, c.IP()).Result()
+	ttl, _ := r2.TTL(database.Ctx, c.IP()).Result()
+
+	resp, err := PrepareResponse(c, body, shortUrlID, quotaLeft, ttl)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to prepare response",
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(resp)
+}
+
+// ValidateRequest validates the request and checks for rate limiting.
+func ValidateRequest(c *fiber.Ctx, body *request) error {
 	// Check if the user has reached the rate limit.
 	r2 := database.CreateClient(1)
 	defer r2.Close()
 
 	quotaLeft, err := r2.Get(database.Ctx, c.IP()).Result()
-	// The user has not used the application in the last {RateLimitDuration} time
-	if err != redis.Nil {
+	if err == redis.Nil {
 		_ = r2.Set(database.Ctx, c.IP(), os.Getenv("API_QUOTA"), rateLimitDuration).Err()
 	} else {
-		// The user has used the application in the last {RateLimitDuration} time
 		quotaLeftInt, _ := strconv.Atoi(quotaLeft)
-
 		if quotaLeftInt <= 0 {
 			limit, _ := r2.TTL(database.Ctx, c.IP()).Result()
-
-			// Convert the limit duration into hours and minutes
-			hours := int(limit.Hours())
-			minutes := int(limit.Minutes()) % 60
-
-			// Construct a readable string for the reset time
-			resetTime := fmt.Sprintf("%d hours %d minutes", hours, minutes)
-
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-				"error":    "Rate limit exceeded",
-				"reset_in": resetTime,
-			})
+			return fmt.Errorf("Rate limit exceeded. Reset in %v", limit)
 		}
 	}
 
-	if err := c.BodyParser(&body); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Cannot parse JSON",
-		})
+	if !govalidator.IsURL(body.URL) {
+		return fmt.Errorf("Invalid URL")
 	}
 
-	// If the user tries to use our own domain, we will return an error.
 	if !helpers.CheckForApplicationMatch(body.URL) {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": "Invalid URL",
-		})
+		return fmt.Errorf("Provided URL is not allowed")
 	}
 
 	body.URL = helpers.EnforceHTTP(body.URL)
 
+	return nil
+}
+
+// GenerateShortURL generates a short URL and saves it to the database.
+func GenerateShortURL(c *fiber.Ctx, body *request) (string, error) {
 	var shortUrlID string
 
-	// Trim spaces and check if the customShortURL length is at least {CustomShortURLLength}
 	trimmedCustomShortUrl := strings.TrimSpace(body.CustomShortUrlId)
 	if len(trimmedCustomShortUrl) == 0 {
 		trimmedCustomShortUrl = uuid.New().String()[:6]
 	} else if len(trimmedCustomShortUrl) >= customShortUrlIdLen {
 		shortUrlID = trimmedCustomShortUrl
 	} else {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Custom short URL must be at least 3 characters long and cannot contain spaces",
-		})
+		return "", fmt.Errorf("Custom short URL must be at least %v characters long", customShortUrlIdLen)
 	}
 
-	// Check if the custom short URL is already in use
 	r := database.CreateClient(0)
 	defer r.Close()
 
-	// Check if the custom short URL is already in use
 	inUseVal, _ := r.Get(database.Ctx, shortUrlID).Result()
 	if strings.TrimSpace(inUseVal) != "" {
-		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
-			"error": "Custom short URL is already in use",
-		})
+		return "", fmt.Errorf("Custom short URL is already in use")
 	}
 
-	// If the user has not set an expiration time, we will set it to 1 day.
 	if body.Expiration == 0 {
 		body.Expiration = 24 * time.Hour
 	}
 
-	// Save the URL to the database
-	err = r.Set(database.Ctx, shortUrlID, body.URL, body.Expiration).Err()
+	err := r.Set(database.Ctx, shortUrlID, body.URL, body.Expiration).Err()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to save URL",
-		})
+		return "", fmt.Errorf("Failed to save URL")
 	}
 
-	resp := response{
-		URL:              body.URL,
-		CustomShortUrlId: "",
-		Expiration:       body.Expiration,
-		XRateRemains:     10,
-		XRateLimitReset:  0,
+	return shortUrlID, nil
+}
+
+// PrepareResponse prepares the response to be sent back to the client.
+func PrepareResponse(c *fiber.Ctx, body *request, shortUrlID string, quotaLeft string, ttl time.Duration) (*response, error) {
+	resp := &response{
+		URL:             body.URL,
+		CustomShort:     "",
+		Expiration:      body.Expiration,
+		XRateRemains:    10,
+		XRateLimitReset: 24,
 	}
 
-	r2.Decr(database.Ctx, c.IP())
+	quotaLeftInt, _ := strconv.Atoi(quotaLeft)
+	resp.XRateRemains = quotaLeftInt
+	resp.XRateLimitReset = ttl / time.Nanosecond / time.Minute / time.Hour
 
-	quotaLeft, _ = r2.Get(database.Ctx, c.IP()).Result()
-	resp.XRateRemains, _ = strconv.Atoi(quotaLeft)
-
-	ttl, _ := r2.TTL(database.Ctx, c.IP()).Result()
-	resp.XRateLimitReset = ttl
-
-	var url string
 	applicationHost := os.Getenv("APPLICATION_HOST")
 	applicationPort := os.Getenv("APPLICATION_PORT")
 
 	if strings.TrimSpace(applicationPort) != "" {
-		url = fmt.Sprintf("%s:%s/%s", applicationHost, applicationPort, shortUrlID)
+		resp.CustomShort = fmt.Sprintf("%s:%s/%s", applicationHost, applicationPort, shortUrlID)
 	} else {
-		url = fmt.Sprintf("%s/%s", applicationHost, shortUrlID)
+		resp.CustomShort = fmt.Sprintf("%s/%s", applicationHost, shortUrlID)
 	}
 
-	resp.CustomShortUrlId = url
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return resp, nil
 }
