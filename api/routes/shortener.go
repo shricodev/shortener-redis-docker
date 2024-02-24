@@ -16,22 +16,22 @@ import (
 )
 
 const (
-	RateLimitDuration    = 24 * time.Hour
-	CustomShortURLLength = 3
+	rateLimitDuration    = 24 * time.Hour
+	customShortURLLength = 3
 )
 
 type request struct {
-	URL            string        `json:"url"`
-	CustomShortURL string        `json:"custom_short"`
-	Expiration     time.Duration `json:"expiration"`
+	URL              string        `json:"url"`
+	CustomShortUrlId string        `json:"custom_short"`
+	Expiration       time.Duration `json:"expiration"`
 }
 
 type response struct {
-	Url             string        `json:"url"`
-	CustomShortURL  string        `json:"custom_short"`
-	Expiration      time.Duration `json:"expiration"`
-	XRateRemains    int           `json:"x-rate-remain"`
-	XRateLimitReset time.Duration `json:"x-rate-limit-reset"`
+	URL              string        `json:"url"`
+	CustomShortUrlId string        `json:"custom_short"`
+	Expiration       time.Duration `json:"expiration"`
+	XRateRemains     int           `json:"x-rate-remain"`
+	XRateLimitReset  time.Duration `json:"x-rate-limit-reset"`
 }
 
 func ShortenURL(c *fiber.Ctx) error {
@@ -47,15 +47,15 @@ func ShortenURL(c *fiber.Ctx) error {
 	r2 := database.CreateClient(1)
 	defer r2.Close()
 
-	val, err := r2.Get(database.Ctx, c.IP()).Result()
+	quota_left, err := r2.Get(database.Ctx, c.IP()).Result()
 	// The user has not used the application in the last {RateLimitDuration} time
 	if err != redis.Nil {
-		_ = r2.Set(database.Ctx, c.IP(), os.Getenv("API_QUOTA"), RateLimitDuration).Err()
+		_ = r2.Set(database.Ctx, c.IP(), os.Getenv("API_QUOTA"), rateLimitDuration).Err()
 	} else {
 		// The user has used the application in the last {RateLimitDuration} time
-		valInt, _ := strconv.Atoi(val)
+		quota_left_int, _ := strconv.Atoi(quota_left)
 
-		if valInt <= 0 {
+		if quota_left_int <= 0 {
 			limit, _ := r2.TTL(database.Ctx, c.IP()).Result()
 
 			// Convert the limit duration into hours and minutes
@@ -63,11 +63,11 @@ func ShortenURL(c *fiber.Ctx) error {
 			minutes := int(limit.Minutes()) % 60
 
 			// Construct a readable string for the reset time
-			resetTime := fmt.Sprintf("%d hours %d minutes", hours, minutes)
+			reset_time := fmt.Sprintf("%d hours %d minutes", hours, minutes)
 
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 				"error":    "Rate limit exceeded",
-				"reset_in": resetTime,
+				"reset_in": reset_time,
 			})
 		}
 	}
@@ -87,14 +87,14 @@ func ShortenURL(c *fiber.Ctx) error {
 
 	body.URL = helpers.EnforceHTTP(body.URL)
 
-	var short_url string
+	var short_url_id string
 
 	// Trim spaces and check if the customShortURL length is at least {CustomShortURLLength}
-	trimmedCustomShortURL := strings.TrimSpace(body.CustomShortURL)
-	if len(trimmedCustomShortURL) == 0 {
-		trimmedCustomShortURL = uuid.New().String()[:6]
-	} else if len(trimmedCustomShortURL) >= CustomShortURLLength {
-		short_url = trimmedCustomShortURL
+	trimmed_custom_short_url := strings.TrimSpace(body.CustomShortUrlId)
+	if len(trimmed_custom_short_url) == 0 {
+		trimmed_custom_short_url = uuid.New().String()[:6]
+	} else if len(trimmed_custom_short_url) >= customShortURLLength {
+		short_url_id = trimmed_custom_short_url
 	} else {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Custom short URL must be at least 3 characters long and cannot contain spaces",
@@ -106,7 +106,7 @@ func ShortenURL(c *fiber.Ctx) error {
 	defer r.Close()
 
 	// Check if the custom short URL is already in use
-	in_use_val, _ := r.Get(database.Ctx, short_url).Result()
+	in_use_val, _ := r.Get(database.Ctx, short_url_id).Result()
 	if strings.TrimSpace(in_use_val) != "" {
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
 			"error": "Custom short URL is already in use",
@@ -119,13 +119,39 @@ func ShortenURL(c *fiber.Ctx) error {
 	}
 
 	// Save the URL to the database
-	err = r.Set(database.Ctx, short_url, body.URL, body.Expiration).Err()
-  if err != nil {
-    return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-      "error": "Failed to save URL",
-    })
-  }
+	err = r.Set(database.Ctx, short_url_id, body.URL, body.Expiration).Err()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to save URL",
+		})
+	}
+
+	resp := response{
+		URL:              body.URL,
+		CustomShortUrlId: "",
+		Expiration:       body.Expiration,
+		XRateRemains:     10,
+		XRateLimitReset:  0,
+	}
 
 	r2.Decr(database.Ctx, c.IP())
-	return nil
+
+	quota_left, _ = r2.Get(database.Ctx, c.IP()).Result()
+	resp.XRateRemains, _ = strconv.Atoi(quota_left)
+
+	ttl, _ := r2.TTL(database.Ctx, c.IP()).Result()
+	resp.XRateLimitReset = ttl
+
+	var url string
+	applicationHost := os.Getenv("APPLICATION_HOST")
+	applicationPort := os.Getenv("APPLICATION_PORT")
+
+	if strings.TrimSpace(applicationPort) != "" {
+		url = fmt.Sprintf("%s:%s/%s", applicationHost, applicationPort, short_url_id)
+	} else {
+		url = fmt.Sprintf("%s/%s", applicationHost, short_url_id)
+	}
+
+	resp.CustomShortUrlId = url
+	return c.Status(fiber.StatusCreated).JSON(resp)
 }
