@@ -4,16 +4,21 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/shricodev/shortener-redis-docker/database"
 	"github.com/shricodev/shortener-redis-docker/helpers"
 )
 
-const RateLimitDuration = 24 * time.Hour
+const (
+	RateLimitDuration    = 24 * time.Hour
+	CustomShortURLLength = 3
+)
 
 type request struct {
 	URL            string        `json:"url"`
@@ -81,6 +86,46 @@ func ShortenURL(c *fiber.Ctx) error {
 	}
 
 	body.URL = helpers.EnforceHTTP(body.URL)
+
+	var short_url string
+
+	// Trim spaces and check if the customShortURL length is at least {CustomShortURLLength}
+	trimmedCustomShortURL := strings.TrimSpace(body.CustomShortURL)
+	if len(trimmedCustomShortURL) == 0 {
+		trimmedCustomShortURL = uuid.New().String()[:6]
+	} else if len(trimmedCustomShortURL) >= CustomShortURLLength {
+		short_url = trimmedCustomShortURL
+	} else {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Custom short URL must be at least 3 characters long and cannot contain spaces",
+		})
+	}
+
+	// Check if the custom short URL is already in use
+	r := database.CreateClient(0)
+	defer r.Close()
+
+	// Check if the custom short URL is already in use
+	in_use_val, _ := r.Get(database.Ctx, short_url).Result()
+	if strings.TrimSpace(in_use_val) != "" {
+		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
+			"error": "Custom short URL is already in use",
+		})
+	}
+
+	// If the user has not set an expiration time, we will set it to 1 day.
+	if body.Expiration == 0 {
+		body.Expiration = 24 * time.Hour
+	}
+
+	// Save the URL to the database
+	err = r.Set(database.Ctx, short_url, body.URL, body.Expiration).Err()
+  if err != nil {
+    return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+      "error": "Failed to save URL",
+    })
+  }
+
 	r2.Decr(database.Ctx, c.IP())
 	return nil
 }
